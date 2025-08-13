@@ -7,9 +7,12 @@ from telegram.ext import (
     ContextTypes, filters
 )
 
+# ==== STATES ====
 ASK_NAME, ASK_EMAIL, ASK_PHONE = range(3)
+
 EMAIL_REGEX = re.compile(r"^[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}$")
 
+# ==== SHEET HELPERS ====
 def _ws():
     creds_info = json.loads(os.environ["GOOGLE_CREDENTIALS"])
     creds = Credentials.from_service_account_info(
@@ -21,7 +24,7 @@ def _ws():
     return sh.sheet1
 
 def sheet_email_exists(ws, email):
-    emails = [e.strip().lower() for e in ws.col_values(4)[1:] if e]
+    emails = [e.strip().lower() for e in ws.col_values(4)[1:] if e]   # kolona D = email
     return email.strip().lower() in emails
 
 def sheet_add(ws, chat_id, name, email, password, status="pending", notes=""):
@@ -32,12 +35,13 @@ def sheet_update(ws, chat_id, email, status, notes=""):
     rows = ws.get_all_values()
     for i, r in enumerate(rows[1:], start=2):
         if len(r) >= 4 and r[1] == str(chat_id) and r[3].strip().lower() == email.strip().lower():
-            r[5] = status
+            r[5] = status  # status (F)
             if len(r) >= 7:
                 r[6] = ((r[6] + " | ") if r[6] else "") + (notes or "")
             ws.update(f"A{i}:G{i}", [r])
             break
 
+# ==== PUPPETEER SERVICE ====
 PUP_URL = os.environ["PUPPETEER_API_URL"].rstrip("/")
 PUP_SECRET = os.environ["PUPPETEER_SHARED_SECRET"]
 
@@ -49,7 +53,7 @@ def _norm_phone(raw: str, default_cc="+381") -> str:
     if s.startswith("0"):  return default_cc + s[1:]
     return "+" + s
 
-async def call_signup(name, email, password, phone, country="Serbia"):
+async def call_demo(name, email, password, phone, country="Serbia"):
     headers = {"X-Auth": PUP_SECRET, "Content-Type": "application/json"}
     payload = {"name": name, "email": email, "password": password, "phone": phone, "country": country}
     async with httpx.AsyncClient(timeout=httpx.Timeout(120.0, connect=25.0)) as client:
@@ -58,14 +62,16 @@ async def call_signup(name, email, password, phone, country="Serbia"):
         data = r.json() if ok else {"error": f"HTTP {r.status_code}", "body": r.text[:400]}
         return ok, data
 
-async def call_create_mt4(email, password):
+async def call_mt4(email, password):
     headers = {"X-Auth": PUP_SECRET, "Content-Type": "application/json"}
+    payload = {"email": email, "password": password}
     async with httpx.AsyncClient(timeout=httpx.Timeout(120.0, connect=25.0)) as client:
-        r = await client.post(f"{PUP_URL}/create-mt4", headers=headers, json={"email": email, "password": password})
+        r = await client.post(f"{PUP_URL}/create-mt4", headers=headers, json=payload)
         ok = r.status_code == 200
         data = r.json() if ok else {"error": f"HTTP {r.status_code}", "body": r.text[:400]}
         return ok, data
 
+# ==== HANDLERS ====
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Zdravo! Kako se zoveš? (npr. Marko)")
     return ASK_NAME
@@ -84,6 +90,7 @@ async def got_email(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not EMAIL_REGEX.match(email):
         await update.message.reply_text("Email nije validan. Unesi ponovo:")
         return ASK_EMAIL
+
     ctx.user_data["email"] = email
     await update.message.reply_text("Unesi broj telefona (sa pozivnim, npr. +381641234567 ili 064...):")
     return ASK_PHONE
@@ -105,49 +112,56 @@ async def got_phone(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Taj email je već registrovan. Unesi drugi:")
         return ASK_EMAIL
 
+    # upiši phone u notes da ne menjamo šemu tabele
     sheet_add(ws, chat_id, name, email, password, status="pending", notes=f"phone:{phone}")
 
     await update.message.reply_text(f"✅ Hvala, {name}! Kreiram tvoj DEMO... Sačekaj 10–30 sekundi.")
 
-    ok1, data1 = await call_signup(name, email, password, phone, country="Serbia")
-    if ok1 and data1.get("ok"):
-        sheet_update(ws, chat_id, email, "created", data1.get("note",""))
-        await update.message.reply_text("🎉 Demo je kreiran! Pripremam MT4 podatke...")
-    else:
-        msg = (data1.get("error") or data1.get("note") or "nepoznato")
-        sheet_update(ws, chat_id, email, "error", msg)
+    # 1) DEMO signup
+    ok1, data1 = await call_demo(name, email, password, phone, country="Serbia")
+    if not ok1 or not data1.get("ok"):
+        msg = (data1 or {}).get("error") or (data1 or {}).get("note") or "nepoznato"
+        sheet_update(ws, chat_id, email, "error", f"signup:{msg}")
         await update.message.reply_text("⚠️ Nije uspelo (verovatno zaštita). Pokušaćemo ponovo ili ručno.")
-        # pokaži poslednji screenshot ako ima
         shots = (data1 or {}).get("screenshots", [])
         if shots:
             try: await update.message.reply_photo(shots[-1], caption="📸 Outcome screenshot")
             except: pass
         return ConversationHandler.END
 
-    # 2) MT4 kreiranje
-    ok2, data2 = await call_create_mt4(email, password)
-    if ok2 and data2.get("ok"):
-        mt_login  = data2.get("mt4_login")
-        mt_server = data2.get("mt4_server")
-        sheet_update(ws, chat_id, email, "mt4", f"mt4:{mt_login}")
-        kb = InlineKeyboardMarkup([[InlineKeyboardButton("Kontakt SUPPORT", url="https://t.me/aleksa_asf01")]])
+    sheet_update(ws, chat_id, email, "created", data1.get("note",""))
+    await update.message.reply_text("🎉 Demo je kreiran! Sada kreiram MT4 nalog...")
+
+    # 2) Kreiraj MT4 u CRM i pošalji login
+    ok2, data2 = await call_mt4(email, password)
+    mt_login = (data2 or {}).get("mt_login")
+    mt_server = (data2 or {}).get("mt_server")
+
+    if ok2 and data2.get("ok") and mt_login:
+        # sačuvaj u notes
+        sheet_update(ws, chat_id, email, "mt4-created", f"mt4:{mt_login}|{mt_server or ''}")
+
+        # poruka sa dugmetom SUPPORT
+        kb = InlineKeyboardMarkup(
+            [[InlineKeyboardButton("Kontaktiraj SUPPORT", url="https://t.me/aleksa_asf01")]]
+        )
         text = (
-            "✅ Tvoj MT4 DEMO je spreman!\n\n"
-            f"Login ID: <code>{mt_login}</code>\n"
-            f"Server: <code>{mt_server}</code>\n"
-            f"Lozinka: <code>{password}</code>\n\n"
-            "Ako imaš poteškoća sa povezivanjem, javi se SUPPORT-u."
+            "✅ MT4 demo nalog je spreman!\n\n"
+            f"• Login ID: <code>{mt_login}</code>\n"
+            f"• Server: {mt_server or 'Ava - Demo'}\n"
+            f"• Lozinka: <code>{password}</code>\n\n"
+            "Ako imaš poteškoća sa priključenjem na tvoj DEMO nalog, javi se SUPPORT-u:"
         )
         await update.message.reply_text(text, reply_markup=kb, parse_mode="HTML")
     else:
-        msg = data2.get("error") or data2.get("note") or "nepoznato"
-        sheet_update(ws, chat_id, email, "mt4-error", msg)
-        await update.message.reply_text("⚠️ Kreiranje MT4 naloga nije uspelo (verovatno zaštita).")
+        note = (data2 or {}).get("note") or (data2 or {}).get("error") or "nepoznato"
+        sheet_update(ws, chat_id, email, "mt4-error", note)
+        await update.message.reply_text("ℹ️ Nalog je napravljen, ali nisam uspeo da povučem MT4 podatke. Javiću se ručno.")
 
-    # pošalji poslednji screenshot iz MT4 koraka ako postoji
+    # prilepi i poslednji screenshot (ako postoji)
     shots2 = (data2 or {}).get("screenshots", [])
     if shots2:
-        try: await update.message.reply_photo(shots2[-1], caption="📸 MT4 screenshot")
+        try: await update.message.reply_photo(shots2[-1], caption="📸 MT4 rezultat")
         except: pass
 
     return ConversationHandler.END
@@ -164,7 +178,8 @@ async def broadcast(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         try:
             await ctx.bot.send_message(int(r[1]), "📣 Test broadcast – pozdrav ekipa!")
             sent += 1; await asyncio.sleep(0.05)
-        except: pass
+        except:
+            pass
     await update.message.reply_text(f"Poslato ka {sent} korisnika.")
 
 def main():
