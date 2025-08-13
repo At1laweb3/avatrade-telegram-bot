@@ -1,7 +1,7 @@
 import os, json, re, datetime, asyncio
 import httpx, gspread
 from google.oauth2.service_account import Credentials
-from telegram import Update
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     ApplicationBuilder, CommandHandler, MessageHandler, ConversationHandler,
     ContextTypes, filters
@@ -29,16 +29,13 @@ def sheet_email_exists(ws, email):
 
 def sheet_add(ws, chat_id, name, email, password, status="pending", notes=""):
     ts = datetime.datetime.utcnow().isoformat()
-    # Struktura ostaje ista: [ts, chat_id, name, email, password, status, notes]
     ws.append_row([ts, str(chat_id), name, email, password, status, notes], value_input_option="RAW")
 
 def sheet_update(ws, chat_id, email, status, notes=""):
     rows = ws.get_all_values()
     for i, r in enumerate(rows[1:], start=2):
         if len(r) >= 4 and r[1] == str(chat_id) and r[3].strip().lower() == email.strip().lower():
-            # status (kolona F = index 5)
-            r[5] = status
-            # notes (kolona G = index 6) -> nadoveži, ne prepisuj
+            r[5] = status  # status (F)
             if len(r) >= 7:
                 r[6] = ((r[6] + " | ") if r[6] else "") + (notes or "")
             ws.update(f"A{i}:G{i}", [r])
@@ -56,11 +53,20 @@ def _norm_phone(raw: str, default_cc="+381") -> str:
     if s.startswith("0"):  return default_cc + s[1:]
     return "+" + s
 
-async def call_puppeteer(name, email, password, phone, country="Serbia"):
+async def call_demo(name, email, password, phone, country="Serbia"):
     headers = {"X-Auth": PUP_SECRET, "Content-Type": "application/json"}
     payload = {"name": name, "email": email, "password": password, "phone": phone, "country": country}
     async with httpx.AsyncClient(timeout=httpx.Timeout(120.0, connect=25.0)) as client:
         r = await client.post(f"{PUP_URL}/create-demo", headers=headers, json=payload)
+        ok = r.status_code == 200
+        data = r.json() if ok else {"error": f"HTTP {r.status_code}", "body": r.text[:400]}
+        return ok, data
+
+async def call_mt4(email, password):
+    headers = {"X-Auth": PUP_SECRET, "Content-Type": "application/json"}
+    payload = {"email": email, "password": password}
+    async with httpx.AsyncClient(timeout=httpx.Timeout(120.0, connect=25.0)) as client:
+        r = await client.post(f"{PUP_URL}/create-mt4", headers=headers, json=payload)
         ok = r.status_code == 200
         data = r.json() if ok else {"error": f"HTTP {r.status_code}", "body": r.text[:400]}
         return ok, data
@@ -111,21 +117,51 @@ async def got_phone(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(f"✅ Hvala, {name}! Kreiram tvoj DEMO... Sačekaj 10–30 sekundi.")
 
-    ok, data = await call_puppeteer(name, email, password, phone, country="Serbia")
-    if ok and data.get("ok"):
-        sheet_update(ws, chat_id, email, "created", data.get("note",""))
-        await update.message.reply_text("🎉 Demo je kreiran! Uskoro ću ti poslati MetaTrader detalje.")
-    else:
-        # prikaži grešku/napomenu
-        msg = data.get("error") or data.get("note") or "nepoznato"
-        sheet_update(ws, chat_id, email, "error", msg)
+    # 1) DEMO signup
+    ok1, data1 = await call_demo(name, email, password, phone, country="Serbia")
+    if not ok1 or not data1.get("ok"):
+        msg = (data1 or {}).get("error") or (data1 or {}).get("note") or "nepoznato"
+        sheet_update(ws, chat_id, email, "error", f"signup:{msg}")
         await update.message.reply_text("⚠️ Nije uspelo (verovatno zaštita). Pokušaćemo ponovo ili ručno.")
+        shots = (data1 or {}).get("screenshots", [])
+        if shots:
+            try: await update.message.reply_photo(shots[-1], caption="📸 Outcome screenshot")
+            except: pass
+        return ConversationHandler.END
 
-    # pošalji screenshot (poslednji, outcome)
-    shots = (data or {}).get("screenshots", [])
-    if shots:
-        try:
-            await update.message.reply_photo(shots[-1], caption="📸 Outcome screenshot")
+    sheet_update(ws, chat_id, email, "created", data1.get("note",""))
+    await update.message.reply_text("🎉 Demo je kreiran! Sada kreiram MT4 nalog...")
+
+    # 2) Kreiraj MT4 u CRM i pošalji login
+    ok2, data2 = await call_mt4(email, password)
+    mt_login = (data2 or {}).get("mt_login")
+    mt_server = (data2 or {}).get("mt_server")
+
+    if ok2 and data2.get("ok") and mt_login:
+        # sačuvaj u notes
+        sheet_update(ws, chat_id, email, "mt4-created", f"mt4:{mt_login}|{mt_server or ''}")
+
+        # poruka sa dugmetom SUPPORT
+        kb = InlineKeyboardMarkup(
+            [[InlineKeyboardButton("Kontaktiraj SUPPORT", url="https://t.me/aleksa_asf01")]]
+        )
+        text = (
+            "✅ MT4 demo nalog je spreman!\n\n"
+            f"• Login ID: <code>{mt_login}</code>\n"
+            f"• Server: {mt_server or 'Ava - Demo'}\n"
+            f"• Lozinka: <code>{password}</code>\n\n"
+            "Ako imaš poteškoća sa priključenjem na tvoj DEMO nalog, javi se SUPPORT-u:"
+        )
+        await update.message.reply_text(text, reply_markup=kb, parse_mode="HTML")
+    else:
+        note = (data2 or {}).get("note") or (data2 or {}).get("error") or "nepoznato"
+        sheet_update(ws, chat_id, email, "mt4-error", note)
+        await update.message.reply_text("ℹ️ Nalog je napravljen, ali nisam uspeo da povučem MT4 podatke. Javiću se ručno.")
+
+    # prilepi i poslednji screenshot (ako postoji)
+    shots2 = (data2 or {}).get("screenshots", [])
+    if shots2:
+        try: await update.message.reply_photo(shots2[-1], caption="📸 MT4 rezultat")
         except: pass
 
     return ConversationHandler.END
