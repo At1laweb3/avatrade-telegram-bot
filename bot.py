@@ -7,18 +7,16 @@ from telegram.ext import (
     ContextTypes, filters
 )
 
+# ==== STATES ====
 ASK_NAME, ASK_EMAIL, ASK_PHONE = range(3)
 EMAIL_REGEX = re.compile(r"^[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}$")
 
-# ===== SHEET =====
+# ==== SHEET HELPERS ====
 def _ws():
     creds_info = json.loads(os.environ["GOOGLE_CREDENTIALS"])
     creds = Credentials.from_service_account_info(
         creds_info,
-        scopes=[
-            "https://www.googleapis.com/auth/spreadsheets",
-            "https://www.googleapis.com/auth/drive",
-        ],
+        scopes=["https://www.googleapis.com/auth/spreadsheets","https://www.googleapis.com/auth/drive"],
     )
     gc = gspread.authorize(creds)
     sh = gc.open(os.environ.get("GSHEET_NAME", "ForexBotUsers"))
@@ -36,43 +34,44 @@ def sheet_update(ws, chat_id, email, status, notes=""):
     rows = ws.get_all_values()
     for i, r in enumerate(rows[1:], start=2):
         if len(r) >= 4 and r[1] == str(chat_id) and r[3].strip().lower() == email.strip().lower():
-            if len(r) < 7:
-                r += [""] * (7 - len(r))
             r[5] = status
-            r[6] = ((r[6] + " | ") if r[6] else "") + (notes or "")
+            if len(r) >= 7:
+                r[6] = ((r[6] + " | ") if r[6] else "") + (notes or "")
             ws.update(f"A{i}:G{i}", [r])
             break
 
-# ===== PUPPETEER SERVICE =====
+# ==== PUPPETEER SERVICE ====
 PUP_URL = os.environ["PUPPETEER_API_URL"].rstrip("/")
 PUP_SECRET = os.environ["PUPPETEER_SHARED_SECRET"]
 
 def _norm_phone(raw: str, default_cc="+381") -> str:
-    s = "".join(ch for ch in raw.strip() if ch.isdigit() or ch == "+")
+    s = "".join(ch for ch in raw.strip() if ch.isdigit() or ch=="+")
     if not s: return ""
-    if s.startswith("+"):  return s
+    if s.startswith("+"): return s
     if s.startswith("00"): return "+" + s[2:]
     if s.startswith("0"):  return default_cc + s[1:]
     return "+" + s
 
-async def _post_json(path: str, payload: dict):
+async def call_puppeteer_create_demo(name, email, password, phone, country="Serbia"):
     headers = {"X-Auth": PUP_SECRET, "Content-Type": "application/json"}
-    timeout = httpx.Timeout(120.0, connect=20.0)  # hard cap da ne visi
-    async with httpx.AsyncClient(timeout=timeout) as client:
-        r = await client.post(f"{PUP_URL}{path}", headers=headers, json=payload)
+    payload = {"name": name, "email": email, "password": password, "phone": phone, "country": country}
+    # ostavljam veći server timeout, ali ispod u handleru limitiramo čekanje na ~35s
+    async with httpx.AsyncClient(timeout=httpx.Timeout(180.0, connect=30.0)) as client:
+        r = await client.post(f"{PUP_URL}/create-demo", headers=headers, json=payload)
         ok = r.status_code == 200
         data = r.json() if ok else {"error": f"HTTP {r.status_code}", "body": r.text[:400]}
         return ok, data
 
-async def call_puppeteer_create_demo(name, email, password, phone, country="Serbia"):
-    return await _post_json("/create-demo", {
-        "name": name, "email": email, "password": password, "phone": phone, "country": country
-    })
-
 async def call_puppeteer_create_mt4(email, password):
-    return await _post_json("/create-mt4", {"email": email, "password": password})
+    headers = {"X-Auth": PUP_SECRET, "Content-Type": "application/json"}
+    payload = {"email": email, "password": password}
+    async with httpx.AsyncClient(timeout=httpx.Timeout(180.0, connect=30.0)) as client:
+        r = await client.post(f"{PUP_URL}/create-mt4", headers=headers, json=payload)
+        ok = r.status_code == 200
+        data = r.json() if ok else {"error": f"HTTP {r.status_code}", "body": r.text[:400]}
+        return ok, data
 
-# ===== HANDLERS =====
+# ==== HANDLERS ====
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Zdravo! Kako se zoveš? (npr. Marko)")
     return ASK_NAME
@@ -113,50 +112,45 @@ async def got_phone(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return ASK_EMAIL
 
     sheet_add(ws, chat_id, name, email, password, status="pending", notes=f"phone:{phone}")
+
     await update.message.reply_text(f"✅ Hvala, {name}! Kreiram tvoj DEMO... Sačekaj 10–30 sekundi.")
 
-    # ---- DEMO ----
+    # 1) DEMO — čekamo najviše ~35s pa nastavljamo dalje bez obzira na ishod
+    demo_task = asyncio.create_task(call_puppeteer_create_demo(name, email, password, phone, country="Serbia"))
+    shots = []
     try:
-        ok, data = await call_puppeteer_create_demo(name, email, password, phone, country="Serbia")
-    except Exception as e:
-        sheet_update(ws, chat_id, email, "error", f"demo_exc:{e}")
-        await update.message.reply_text("⚠️ Desio se problem sa servisom. Pokušaćemo ponovo ili ručno.")
-        return ConversationHandler.END
+        ok, data = await asyncio.wait_for(demo_task, timeout=35.0)
+        if ok and data.get("screenshots"): shots = data["screenshots"]
+        if ok and data.get("ok"):
+            sheet_update(ws, chat_id, email, "created", data.get("note",""))
+        else:
+            sheet_update(ws, chat_id, email, "maybe_created", data.get("note","timeout_or_block"))
+    except asyncio.TimeoutError:
+        sheet_update(ws, chat_id, email, "maybe_created", "demo_timeout_35s")
 
-    shots = (data or {}).get("screenshots", [])
+    # probaj da pošalješ poslednji screenshot ako ga imamo
     if shots:
         try: await update.message.reply_photo(shots[-1], caption="📸 Outcome screenshot")
         except: pass
 
-    demo_ok = bool(data.get("ok")) or bool(data.get("likely_created"))
-    if demo_ok:
-        sheet_update(ws, chat_id, email, "created", data.get("note",""))
-        await update.message.reply_text("🎉 Demo (verovatno) kreiran. Pokušavam da kreiram MT4 nalog...")
+    # 2) MT4
+    await update.message.reply_text("🎉 Demo (verovatno) kreiran. Pokušavam da kreiram MT4 nalog…")
+    mt4_ok, mt4 = await call_puppeteer_create_mt4(email, password)
 
-        # ---- MT4 ----
-        try:
-            mt4_ok, mt4 = await call_puppeteer_create_mt4(email, password)
-        except Exception as e:
-            sheet_update(ws, chat_id, email, "mt4_error", f"mt4_exc:{e}")
-            await update.message.reply_text("ℹ️ Nalog je verovatno kreiran, ali nisam uspeo da povučem MT4 podatke odmah. Uradiću ručno.")
-            return ConversationHandler.END
-
-        if mt4_ok and mt4.get("ok") and mt4.get("mt4_login"):
-            mt4_login = mt4["mt4_login"]
-            sheet_update(ws, chat_id, email, "mt4_ok", f"mt4_login:{mt4_login}")
-            kb = InlineKeyboardMarkup([[InlineKeyboardButton("Kontaktiraj SUPPORT", url="https://t.me/aleksa_asf01")]])
-            await update.message.reply_text(
-                f"MetaTrader 4 Login: {mt4_login}\nŠifra: {password}\n\nAko imaš poteškoća sa prijavom, javi SUPPORT-u ⬇️",
-                reply_markup=kb
-            )
-        else:
-            msg = mt4.get("error") or mt4.get("phase") or "nepoznato"
-            sheet_update(ws, chat_id, email, "mt4_error", msg)
-            await update.message.reply_text("ℹ️ Nalog je napravljen, ali nisam uspeo da povučem MT4 podatke odmah. Uradiću ručno.")
+    if mt4_ok and mt4.get("ok") and mt4.get("mt4_login"):
+        mt4_login = mt4["mt4_login"]
+        sheet_update(ws, chat_id, email, "mt4_ok", f"mt4_login:{mt4_login}")
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("Kontaktiraj SUPPORT", url="https://t.me/aleksa_asf01")]
+        ])
+        await update.message.reply_text(
+            f"MetaTrader 4 Login: {mt4_login}\nŠifra: {password}\n\nAko imaš poteškoća sa prijavom, klikni SUPPORT ⬇️",
+            reply_markup=kb
+        )
     else:
-        msg = data.get("error") or data.get("note") or "nepoznato"
-        sheet_update(ws, chat_id, email, "error", msg)
-        await update.message.reply_text("⚠️ Nije uspelo (verovatno zaštita). Pokušaćemo ponovo ili ručno.")
+        msg = (mt4 or {}).get("error") or (mt4 or {}).get("phase") or "nepoznato"
+        sheet_update(ws, chat_id, email, "mt4_error", msg)
+        await update.message.reply_text("ℹ️ Nalog je napravljen, ali nisam uspeo odmah da povučem MT4 podatke. Javiću se ručno.")
 
     return ConversationHandler.END
 
