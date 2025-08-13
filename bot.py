@@ -7,11 +7,9 @@ from telegram.ext import (
     ContextTypes, filters
 )
 
-# ==== STATES ====
 ASK_NAME, ASK_EMAIL, ASK_PHONE = range(3)
 EMAIL_REGEX = re.compile(r"^[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}$")
 
-# ==== SHEET HELPERS ====
 def _ws():
     creds_info = json.loads(os.environ["GOOGLE_CREDENTIALS"])
     creds = Credentials.from_service_account_info(
@@ -26,7 +24,7 @@ def _ws():
     return sh.sheet1
 
 def sheet_email_exists(ws, email):
-    emails = [e.strip().lower() for e in ws.col_values(4)[1:] if e]  # kolona D = email
+    emails = [e.strip().lower() for e in ws.col_values(4)[1:] if e]
     return email.strip().lower() in emails
 
 def sheet_add(ws, chat_id, name, email, password, status="pending", notes=""):
@@ -43,7 +41,6 @@ def sheet_update(ws, chat_id, email, status, notes=""):
             ws.update(f"A{i}:G{i}", [r])
             break
 
-# ==== PUPPETEER SERVICE ====
 PUP_URL = os.environ["PUPPETEER_API_URL"].rstrip("/")
 PUP_SECRET = os.environ["PUPPETEER_SHARED_SECRET"]
 
@@ -73,7 +70,6 @@ async def call_puppeteer_create_mt4(email, password):
         data = r.json() if ok else {"error": f"HTTP {r.status_code}", "body": r.text[:400]}
         return ok, data
 
-# ==== HANDLERS ====
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Zdravo! Kako se zoveš? (npr. Marko)")
     return ASK_NAME
@@ -119,7 +115,18 @@ async def got_phone(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     # 1) DEMO
     ok_http, data = await call_puppeteer_create_demo(name, email, password, phone, country="Serbia")
-    success = ok_http and (data.get("ok") or data.get("likely_created"))
+
+    # heuristike i kad servis ne označi ok
+    success = False
+    if ok_http:
+        success = bool(data.get("ok") or data.get("likely_created"))
+        # još malo heuristike na klijentu
+        ex = (data or {}).get("outcome_excerpt","") + " " + (data or {}).get("page_excerpt","")
+        url = (data or {}).get("url","")
+        if re.search(r"Your Demo Account is Being Created|You will be transferred to the trading platform", ex, re.I):
+            success = True
+        if re.search(r"webtrader7\.avatrade\.com/.*/accounts|customer_id=", url, re.I):
+            success = True
 
     # pošalji poslednji screenshot (ako postoji)
     shots = (data or {}).get("screenshots", [])
@@ -129,32 +136,25 @@ async def got_phone(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         except:
             pass
 
-    if success:
-        sheet_update(ws, chat_id, email, "created", data.get("note",""))
-
-        # 2) MT4 (CFD-MT4 EUR)
-        await update.message.reply_text("🎉 Demo je kreiran! Sada kreiram MT4 nalog…")
+    # 2) probaj MT4 čak i ako demo nije eksplicitno 'ok'
+    if ok_http:
+        await update.message.reply_text("🎉 Demo (verovatno) kreiran. Pokušavam da kreiram MT4 nalog…")
         mt4_ok, mt4 = await call_puppeteer_create_mt4(email, password)
 
         if mt4_ok and mt4.get("ok") and mt4.get("mt4_login"):
             mt4_login = mt4["mt4_login"]
             sheet_update(ws, chat_id, email, "mt4_ok", f"mt4_login:{mt4_login}")
-            kb = InlineKeyboardMarkup(
-                [[InlineKeyboardButton("Kontaktiraj SUPPORT", url="https://t.me/aleksa_asf01")]]
-            )
+            kb = InlineKeyboardMarkup([[InlineKeyboardButton("Kontaktiraj SUPPORT", url="https://t.me/aleksa_asf01")]])
             await update.message.reply_text(
-                f"MetaTrader 4 Login: {mt4_login}\nŠifra: {password}\n\nAko imaš poteškoća sa priključivanjem na DEMO, javi se SUPPORTU ⬇️",
+                f"MetaTrader 4 Login: {mt4_login}\nŠifra: {password}\n\nAko imaš poteškoća sa priključivanjem, javi se SUPPORTU ⬇️",
                 reply_markup=kb
             )
-        else:
-            msg = (mt4 or {}).get("error") or (mt4 or {}).get("phase") or "nepoznato"
-            sheet_update(ws, chat_id, email, "mt4_error", msg)
-            await update.message.reply_text("ℹ️ Nalog je napravljen, ali nisam uspeo odmah da povučem MT4 podatke. Javiću se ručno.")
-    else:
-        msg = (data or {}).get("error") or (data or {}).get("note") or "nepoznato"
-        sheet_update(ws, chat_id, email, "error", msg)
-        await update.message.reply_text("⚠️ Nije uspelo (verovatno zaštita). Pokušaćemo ponovo ili ručno.")
+            return ConversationHandler.END
 
+    # fallback poruka
+    status_msg = (data or {}).get("error") or (data or {}).get("note") or "nepoznato"
+    sheet_update(ws, chat_id, email, "error" if not success else "created", status_msg)
+    await update.message.reply_text("ℹ️ Nalog je verovatno kreiran, ali nisam uspeo da povučem MT4 podatke odmah. Uradiću ručno.")
     return ConversationHandler.END
 
 async def cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -169,8 +169,7 @@ async def broadcast(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         try:
             await ctx.bot.send_message(int(r[1]), "📣 Test broadcast – pozdrav ekipa!")
             sent += 1; await asyncio.sleep(0.05)
-        except:
-            pass
+        except: pass
     await update.message.reply_text(f"Poslato ka {sent} korisnika.")
 
 def main():
