@@ -16,14 +16,17 @@ def _ws():
     creds_info = json.loads(os.environ["GOOGLE_CREDENTIALS"])
     creds = Credentials.from_service_account_info(
         creds_info,
-        scopes=["https://www.googleapis.com/auth/spreadsheets","https://www.googleapis.com/auth/drive"],
+        scopes=[
+            "https://www.googleapis.com/auth/spreadsheets",
+            "https://www.googleapis.com/auth/drive",
+        ],
     )
     gc = gspread.authorize(creds)
     sh = gc.open(os.environ.get("GSHEET_NAME", "ForexBotUsers"))
     return sh.sheet1
 
 def sheet_email_exists(ws, email):
-    emails = [e.strip().lower() for e in ws.col_values(4)[1:] if e]   # kolona D = email
+    emails = [e.strip().lower() for e in ws.col_values(4)[1:] if e]  # kolona D = email
     return email.strip().lower() in emails
 
 def sheet_add(ws, chat_id, name, email, password, status="pending", notes=""):
@@ -115,42 +118,42 @@ async def got_phone(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"✅ Hvala, {name}! Kreiram tvoj DEMO... Sačekaj 10–30 sekundi.")
 
     # 1) DEMO
-    ok, data = await call_puppeteer_create_demo(name, email, password, phone, country="Serbia")
-    if ok and data.get("ok"):
-        sheet_update(ws, chat_id, email, "created", data.get("note",""))
-        # pošalji poslednji screenshot, ako ima
-        shots = (data or {}).get("screenshots", [])
-        if shots:
-            try: await update.message.reply_photo(shots[-1], caption="📸 Outcome screenshot")
-            except: pass
+    ok_http, data = await call_puppeteer_create_demo(name, email, password, phone, country="Serbia")
+    success = ok_http and (data.get("ok") or data.get("likely_created"))
 
-        # 2) MT4 (CFD-MT4 EUR) → posalji login + password
+    # pošalji poslednji screenshot (ako postoji)
+    shots = (data or {}).get("screenshots", [])
+    if shots:
+        try:
+            await update.message.reply_photo(shots[-1], caption="📸 Outcome screenshot")
+        except:
+            pass
+
+    if success:
+        sheet_update(ws, chat_id, email, "created", data.get("note",""))
+
+        # 2) MT4 (CFD-MT4 EUR)
         await update.message.reply_text("🎉 Demo je kreiran! Sada kreiram MT4 nalog…")
         mt4_ok, mt4 = await call_puppeteer_create_mt4(email, password)
 
         if mt4_ok and mt4.get("ok") and mt4.get("mt4_login"):
             mt4_login = mt4["mt4_login"]
             sheet_update(ws, chat_id, email, "mt4_ok", f"mt4_login:{mt4_login}")
-            kb = InlineKeyboardMarkup([
-                [InlineKeyboardButton("Kontaktiraj SUPPORT", url="https://t.me/aleksa_asf01")]
-            ])
+            kb = InlineKeyboardMarkup(
+                [[InlineKeyboardButton("Kontaktiraj SUPPORT", url="https://t.me/aleksa_asf01")]]
+            )
             await update.message.reply_text(
-                f"MetaTrader 4 Login: {mt4_login}\nŠifra: {password}\n\nAko imaš nekih poteškoća sa priključivanjem na tvoj DEMO nalog, javi se SUPPORTU ⬇️",
+                f"MetaTrader 4 Login: {mt4_login}\nŠifra: {password}\n\nAko imaš poteškoća sa priključivanjem na DEMO, javi se SUPPORTU ⬇️",
                 reply_markup=kb
             )
         else:
-            msg = mt4.get("error") or mt4.get("phase") or "nepoznato"
+            msg = (mt4 or {}).get("error") or (mt4 or {}).get("phase") or "nepoznato"
             sheet_update(ws, chat_id, email, "mt4_error", msg)
             await update.message.reply_text("ℹ️ Nalog je napravljen, ali nisam uspeo odmah da povučem MT4 podatke. Javiću se ručno.")
-
     else:
-        msg = data.get("error") or data.get("note") or "nepoznato"
+        msg = (data or {}).get("error") or (data or {}).get("note") or "nepoznato"
         sheet_update(ws, chat_id, email, "error", msg)
         await update.message.reply_text("⚠️ Nije uspelo (verovatno zaštita). Pokušaćemo ponovo ili ručno.")
-        shots = (data or {}).get("screenshots", [])
-        if shots:
-            try: await update.message.reply_photo(shots[-1], caption="📸 Outcome screenshot")
-            except: pass
 
     return ConversationHandler.END
 
@@ -166,7 +169,8 @@ async def broadcast(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         try:
             await ctx.bot.send_message(int(r[1]), "📣 Test broadcast – pozdrav ekipa!")
             sent += 1; await asyncio.sleep(0.05)
-        except: pass
+        except:
+            pass
     await update.message.reply_text(f"Poslato ka {sent} korisnika.")
 
 def main():
